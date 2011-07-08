@@ -1,0 +1,26 @@
+# NOTE - This patch is merged with the as-yet not upstream security fix patch
+From 7f054d7bce4b2ea74e5268f2cf65c467773ee14f Mon Sep 17 00:00:00 2001
+From: Dan Williams <dcbw@redhat.com>
+Date: Tue, 29 Jun 2010 21:19:25 -0700
+Subject: [PATCH] Fix lookup of regular properties when shadow properties are used
+
+Only free the uscore converted name if there's actually a shadow
+property registered for this property; otherwise if there is no
+shadow property we free the uscore converted one and then return
+it immediately after.
+---
+ dbus/dbus-gobject.c |    3 ++-
+ 1 files changed, 2 insertions(+), 1 deletions(-)
+
+--- a/dbus/dbus-gobject.c~	2010-07-14 10:48:14.406738324 -0400
++++ b/dbus/dbus-gobject.c	2010-07-14 10:49:32.874842795 -0400
+@@ -1073,7 +1073,8 @@
+   if (shadow_props)
+     {
+       shadow_prop_name = g_strdup (g_hash_table_lookup (shadow_props, requested_propname));
+-      g_free (uscore_name);
++      if (shadow_prop_name)
++	g_free (uscore_name);
+     }
+ 
+   return shadow_prop_name ? shadow_prop_name : uscore_name;

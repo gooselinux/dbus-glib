@@ -1,0 +1,1092 @@
+From 8afc7074713fc189631f29adc81c266e99647ce3 Mon Sep 17 00:00:00 2001
+From: Colin Walters <walters@verbum.org>
+Date: Mon, 19 Apr 2010 16:47:11 -0400
+Subject: [PATCH] Respect property access flags for writing, allow disabling for reads
+
+Because DBus-GLib originally was designed as a generic "object mapping"
+binding, the handler for org.freedesktop.DBus.Properties simply
+allowed access (read or write) to any GObject property that was
+exported.
+
+Later, the (compile time) introspection XML was added, and while we only
+listed "exported" properties in the dynamic introspection XML, we
+still allowed Get or Set calls to any property that was valid.
+
+With this patch, we deny writes to properties which aren't listed
+in the XML, or are listed as read-only.
+
+For backwards compatibility however, we still allow reads.  A
+service may disable this by calling
+dbus_glib_global_set_disable_legacy_property_access().
+---
+ dbus/dbus-binding-tool-glib.c   |   53 ++++++--
+ dbus/dbus-glib.h                |    2 +
+ dbus/dbus-gobject.c             |  285 ++++++++++++++++++++++++++++++++++-----
+ test/core/my-object.c           |   61 ++++++++-
+ test/core/my-object.h           |    5 +
+ test/core/test-dbus-glib.c      |  248 ++++++++++++++++++++++++++++++++--
+ test/core/test-service-glib.xml |    5 +
+ 7 files changed, 594 insertions(+), 65 deletions(-)
+
+diff --git a/dbus/dbus-binding-tool-glib.c b/dbus/dbus-binding-tool-glib.c
+index 872d1f7..97545df 100644
+--- a/dbus/dbus-binding-tool-glib.c
++++ b/dbus/dbus-binding-tool-glib.c
+@@ -38,6 +38,10 @@
+ #include <string.h>
+ #include <unistd.h>
+ 
++/* Remember to grep for ->format_version in the code if you change this,
++ * most changes should be in dbus-gobject.c. */
++#define FORMAT_VERSION 1
++
+ #define MARSHAL_PREFIX "dbus_glib_marshal_"
+ 
+ typedef struct
+@@ -466,14 +470,13 @@ generate_glue_toplevel (BaseInfo *base, DBusBindingToolCData *data, GError **err
+ {
+   GString *object_introspection_data_blob;
+   GIOChannel *channel;
+-  
++
+   channel = data->channel;
+-  
+-  object_introspection_data_blob = g_string_new_len ("", 0);
+ 
++  object_introspection_data_blob = g_string_new_len ("", 0);
+   data->blob = object_introspection_data_blob;
+   data->count = 0;
+-  
++
+   data->signal_blob = g_string_new_len ("", 0);
+   data->property_blob = g_string_new_len ("", 0);
+ 
+@@ -490,10 +493,9 @@ generate_glue_toplevel (BaseInfo *base, DBusBindingToolCData *data, GError **err
+   WRITE_OR_LOSE ("};\n\n");
+   /* Information about the object. */
+ 
+-  if (!write_printf_to_iochannel ("const DBusGObjectInfo dbus_glib_%s_object_info = {\n",
+-                                  channel, error, data->prefix))
++  if (!write_printf_to_iochannel ("const DBusGObjectInfo dbus_glib_%s_object_info = {  %d,\n",
++                                  channel, error, data->prefix, FORMAT_VERSION))
+     goto io_lose;
+-  WRITE_OR_LOSE ("  0,\n");
+   if (!write_printf_to_iochannel ("  dbus_glib_%s_methods,\n", channel, error, data->prefix))
+     goto io_lose;
+   if (!write_printf_to_iochannel ("  %d,\n", channel, error, data->count))
+@@ -753,13 +755,36 @@ generate_glue (BaseInfo *base, DBusBindingToolCData *data, GError **error)
+       for (tmp = properties; tmp != NULL; tmp = g_slist_next (tmp))
+         {
+           PropertyInfo *prop;
+-	  
+-	  prop = tmp->data;
+-
+-	  g_string_append (data->property_blob, interface_info_get_name (interface));
+-	  g_string_append_c (data->property_blob, '\0');
+-	  g_string_append (data->property_blob, property_info_get_name (prop));
+-	  g_string_append_c (data->property_blob, '\0');
++          PropertyAccessFlags access_flags;
++          const char *access_string;
++          char *uscored;
++
++          prop = tmp->data;
++
++          access_flags = property_info_get_access (prop);
++          if ((access_flags & PROPERTY_READ) && (access_flags & PROPERTY_WRITE))
++            access_string = "readwrite";
++          else if (access_flags & PROPERTY_READ)
++            access_string = "read";
++          else if (access_flags & PROPERTY_WRITE)
++            access_string = "write";
++          else
++            continue;
++
++          /* We append both in the blob so we have to malloc() less when processing
++           * properties */
++          uscored = _dbus_gutils_wincaps_to_uscore (property_info_get_name (prop));
++
++          g_string_append (data->property_blob, interface_info_get_name (interface));
++          g_string_append_c (data->property_blob, '\0');
++          g_string_append (data->property_blob, property_info_get_name (prop));
++          g_string_append_c (data->property_blob, '\0');
++          g_string_append (data->property_blob, uscored);
++          g_string_append_c (data->property_blob, '\0');
++          g_string_append (data->property_blob, access_string);
++          g_string_append_c (data->property_blob, '\0');
++
++          g_free (uscored);
+ 	}
+     }
+   return TRUE;
+diff --git a/dbus/dbus-glib.h b/dbus/dbus-glib.h
+index 1b236d8..baf2567 100644
+--- a/dbus/dbus-glib.h
++++ b/dbus/dbus-glib.h
+@@ -154,6 +154,8 @@ struct _DBusGObjectInfo
+   const char *exported_properties; 
+ };
+ 
++void       dbus_glib_global_set_disable_legacy_property_access (void);
++
+ void       dbus_g_object_type_install_info     (GType                 object_type,
+                                                 const DBusGObjectInfo *info);
+ 
+diff --git a/dbus/dbus-gobject.c b/dbus/dbus-gobject.c
+index b881c02..35ca4e2 100644
+--- a/dbus/dbus-gobject.c
++++ b/dbus/dbus-gobject.c
+@@ -37,7 +37,7 @@
+ 
+ static char *lookup_property_name (GObject    *object,
+                                    const char *wincaps_propiface,
+-                                   const char *wincaps_propname);
++                                   const char *requested_propname);
+ 
+ typedef struct
+ {
+@@ -46,6 +46,8 @@ typedef struct
+ } DBusGErrorInfo;
+ 
+ static GStaticRWLock globals_lock = G_STATIC_RW_LOCK_INIT;
++/* See comments in check_property_access */
++static gboolean disable_legacy_property_access = FALSE;
+ static GHashTable *marshal_table = NULL;
+ static GData *error_metadata = NULL;
+ 
+@@ -83,6 +85,23 @@ uscore_to_wincaps_full (const char *uscore,
+   return g_string_free (str, FALSE);
+ }
+ 
++/* Ugly yes - but we have to accept strings from both formats */
++static gboolean
++compare_strings_ignoring_uscore_vs_dash (const char *a, const char *b)
++{
++  guint i;
++
++  for (i = 0; a[i] && b[i]; i++)
++    {
++      if ((a[i] == '-' && b[i] == '_')
++          || (a[i] == '_' && b[i] == '-'))
++        continue;
++      if (a[i] != b[i])
++        return FALSE;
++    }
++  return (a[i] == '\0') && (b[i] == '\0');
++}
++
+ static char *
+ uscore_to_wincaps (const char *uscore)
+ {
+@@ -281,7 +300,7 @@ method_output_signature_from_object_info (const DBusGObjectInfo *object,
+ }
+ 
+ static const char *
+-propsig_iterate (const char *data, const char **iface, const char **name)
++signal_iterate (const char *data, const char **iface, const char **name)
+ {
+   *iface = data;
+ 
+@@ -291,6 +310,108 @@ propsig_iterate (const char *data, const char **iface, const char **name)
+   return string_table_next (data);
+ }
+ 
++static const char *
++property_iterate (const char  *data,
++                  int          format_version,
++                  const char **iface,
++                  const char **exported_name,
++                  const char **name_uscored,
++                  const char **access_type)
++{
++  *iface = data;
++
++  data = string_table_next (data);
++  *exported_name = data;
++
++  data = string_table_next (data);
++  if (format_version == 1)
++    {
++      *name_uscored = data;
++      data = string_table_next (data);
++      *access_type = data;
++      return string_table_next (data);
++    }
++  else
++    {
++      /* This tells the caller they need to compute it */
++      *name_uscored = NULL;
++      /* We don't know here, however note that we will still check against the
++       * readable/writable flags from GObject's metadata.
++       */
++      *access_type = "readwrite";
++      return data;
++    }
++}
++
++/**
++ * property_info_from_object_info:
++ * @object: introspection data
++ * @interface_name: (allow-none): Expected interface name, or %NULL for any
++ * @property_name: Expected property name (can use "-" or "_" as separator)
++ * @access_type: (out): Can be one of "read", "write", "readwrite"
++ *
++ * Look up property introspection data for the given interface/name pair.
++ *
++ * Returns: %TRUE if property was found
++ */
++static gboolean
++property_info_from_object_info (const DBusGObjectInfo  *object,
++                                const char             *interface_name,
++                                const char             *property_name,
++                                const char            **access_type)
++{
++  const char *properties_iter;
++
++  properties_iter = object->exported_properties;
++  while (properties_iter != NULL && *properties_iter)
++    {
++      const char *cur_interface_name;
++      const char *cur_property_name;
++      const char *cur_uscore_property_name;
++      const char *cur_access_type;
++
++
++      properties_iter = property_iterate (properties_iter, object->format_version,
++                                          &cur_interface_name, &cur_property_name,
++                                          &cur_uscore_property_name, &cur_access_type);
++
++      if (interface_name && strcmp (interface_name, cur_interface_name) != 0)
++        continue;
++
++      /* This big pile of ugly is necessary to support the matrix resulting from multiplying
++       * (v0 data, v1 data) * (FooBar, foo-bar)
++       * In v1 data we have both forms of string, so we do a comparison against both without
++       * having to malloc.
++       * For v0 data, we need to reconstruct the foo-bar form.
++       *
++       * Adding to the complexity is that we *also* have to ignore the distinction between
++       * '-' and '_', because g_object_{get,set} does.
++       */
++      /* First, compare against the primary property name - no malloc required */
++      if (!compare_strings_ignoring_uscore_vs_dash (property_name, cur_property_name))
++        {
++          if (cur_uscore_property_name != NULL
++              && !compare_strings_ignoring_uscore_vs_dash (property_name, cur_uscore_property_name))
++            continue;
++          else
++            {
++              /* v0 metadata, construct uscore */
++              char *tmp_uscored;
++              gboolean matches;
++              tmp_uscored = _dbus_gutils_wincaps_to_uscore (cur_property_name);
++              matches = compare_strings_ignoring_uscore_vs_dash (property_name, tmp_uscored);
++              g_free (tmp_uscored);
++              if (!matches)
++                continue;
++            }
++        }
++
++      *access_type = cur_access_type;
++      return TRUE;
++    }
++  return FALSE;
++}
++
+ static GQuark
+ dbus_g_object_type_dbus_metadata_quark (void)
+ {
+@@ -578,15 +699,19 @@ write_interface (gpointer key, gpointer val, gpointer user_data)
+ 
+   for (; properties; properties = properties->next)
+     {
++      const char *iface;
+       const char *propname;
++      const char *propname_uscore;
++      const char *access_type;
+       GParamSpec *spec;
+       char *dbus_type;
+       gboolean can_set;
+       gboolean can_get;
+       char *s;
+ 
+-      propname = properties->data;
+       spec = NULL;
++      
++      property_iterate (properties->data, object_info->format_version, &iface, &propname, &propname_uscore, &access_type);
+ 
+       s = lookup_property_name (data->object, name, propname);
+ 
+@@ -597,8 +722,9 @@ write_interface (gpointer key, gpointer val, gpointer user_data)
+       dbus_type = _dbus_gtype_to_signature (G_PARAM_SPEC_VALUE_TYPE (spec));
+       g_assert (dbus_type != NULL);
+       
+-      can_set = ((spec->flags & G_PARAM_WRITABLE) != 0 &&
+-		 (spec->flags & G_PARAM_CONSTRUCT_ONLY) == 0);
++      can_set = strcmp (access_type, "readwrite") == 0
++                    && ((spec->flags & G_PARAM_WRITABLE) != 0
++                    && (spec->flags & G_PARAM_CONSTRUCT_ONLY) == 0);
+       
+       can_get = (spec->flags & G_PARAM_READABLE) != 0;
+       
+@@ -689,7 +815,7 @@ introspect_interfaces (GObject *object, GString *xml)
+           const char *iface;
+           const char *signame;
+ 
+-          propsig = propsig_iterate (propsig, &iface, &signame);
++          propsig = signal_iterate (propsig, &iface, &signame);
+ 
+           values = lookup_values (interfaces, iface);
+           values->signals = g_slist_prepend (values->signals, (gpointer) signame);
+@@ -700,11 +826,13 @@ introspect_interfaces (GObject *object, GString *xml)
+         {
+           const char *iface;
+           const char *propname;
++          const char *propname_uscore;
++          const char *access_type;
+ 
+-          propsig = propsig_iterate (propsig, &iface, &propname);
++          propsig = property_iterate (propsig, info->format_version, &iface, &propname, &propname_uscore, &access_type);
+ 
+           values = lookup_values (interfaces, iface);
+-          values->properties = g_slist_prepend (values->properties, (gpointer) propname);
++          values->properties = g_slist_prepend (values->properties, (gpointer)iface);
+         }
+       
+       memset (&data, 0, sizeof (data));
+@@ -925,7 +1053,7 @@ dbus_g_object_type_dbus_shadow_property_quark (void)
+ static char *
+ lookup_property_name (GObject    *object,
+                       const char *wincaps_propiface,
+-                      const char *wincaps_propname)
++                      const char *requested_propname)
+ {
+   const DBusGObjectInfo *object_info;
+   GHashTable *shadow_props;
+@@ -933,9 +1061,9 @@ lookup_property_name (GObject    *object,
+   GType iface_type = 0;
+ 
+   g_assert (wincaps_propiface != NULL);
+-  g_assert (wincaps_propname != NULL);
++  g_assert (requested_propname != NULL);
+ 
+-  uscore_name = _dbus_gutils_wincaps_to_uscore (wincaps_propname);
++  uscore_name = _dbus_gutils_wincaps_to_uscore (requested_propname);
+ 
+   object_info = lookup_object_info_by_iface (object, wincaps_propiface, FALSE, &iface_type);
+   if (!object_info)
+@@ -944,7 +1072,7 @@ lookup_property_name (GObject    *object,
+   shadow_props = (GHashTable *) g_type_get_qdata (iface_type, SHADOW_PROP_QUARK);
+   if (shadow_props)
+     {
+-      shadow_prop_name = g_strdup (g_hash_table_lookup (shadow_props, wincaps_propname));
++      shadow_prop_name = g_strdup (g_hash_table_lookup (shadow_props, requested_propname));
+       g_free (uscore_name);
+     }
+ 
+@@ -1036,24 +1164,14 @@ get_all_object_properties (DBusConnection        *connection,
+     {
+       const char *prop_ifname;
+       const char *prop_name;
++      const char *prop_uscored;
++      const char *access_flags;
+       GParamSpec *pspec;
+       GType value_gtype;
+       GValue value = {0, };
+       gchar *variant_sig;
+ 
+-      prop_ifname = p;
+-
+-      while (*p != '\0')
+-        p++;
+-      p++;
+-      if (*p == '\0') {
+-        g_warning ("malformed exported_properties in object_info");
+-        break;
+-      }
+-      prop_name = p;
+-      while (*p != '\0')
+-        p++;
+-      p++;
++      p = property_iterate (p, object_info->format_version, &prop_ifname, &prop_name, &prop_uscored, &access_flags);
+ 
+       uscore_propname = lookup_property_name (object, wincaps_propiface, prop_name);
+ 
+@@ -1728,6 +1846,70 @@ invoke_object_method (GObject         *object,
+   goto done;
+ }
+ 
++static gboolean
++check_property_access (DBusConnection  *connection,
++                       DBusMessage     *message,
++                       GObject         *object,
++                       const char      *wincaps_propiface,
++                       const char      *requested_propname,
++                       const char      *uscore_propname,
++                       gboolean         is_set)
++{
++  const DBusGObjectInfo *object_info;
++  const char *access_type;
++  DBusMessage *ret;
++  
++  if (!is_set && !disable_legacy_property_access)
++    return TRUE;
++
++  object_info = lookup_object_info_by_iface (object, wincaps_propiface, TRUE, NULL);
++  if (!object_info)
++    {
++      ret = dbus_message_new_error_printf (message,
++                                           DBUS_ERROR_ACCESS_DENIED,
++                                           "Interface \"%s\" isn't exported (or may not exist), can't access property \"%s\"",
++                                           wincaps_propiface,
++                                           requested_propname);
++      dbus_connection_send (connection, ret, NULL);
++      dbus_message_unref (ret);
++      return FALSE;
++    }
++
++  /* Try both forms of property names: "foo_bar" or "FooBar"; for historical
++   * reasons we accept both.
++   */
++  if (object_info
++      && !(property_info_from_object_info (object_info, wincaps_propiface, requested_propname, &access_type)
++           || property_info_from_object_info (object_info, wincaps_propiface, uscore_propname, &access_type)))
++    {
++      ret = dbus_message_new_error_printf (message,
++                                           DBUS_ERROR_ACCESS_DENIED,
++                                           "Property \"%s\" of interface \"%s\" isn't exported (or may not exist)",
++                                           requested_propname,
++                                           wincaps_propiface);
++      dbus_connection_send (connection, ret, NULL);
++      dbus_message_unref (ret);
++      return FALSE;
++    }
++
++  if (strcmp (access_type, "readwrite") == 0)
++    return TRUE;
++  else if (is_set ? strcmp (access_type, "read") == 0 
++             : strcmp (access_type, "write") == 0)
++    {
++       ret = dbus_message_new_error_printf (message,
++                                           DBUS_ERROR_ACCESS_DENIED,
++                                           "Property \"%s\" of interface \"%s\" is not %s",
++                                           requested_propname,
++                                           wincaps_propiface,
++                                           is_set ? "settable" : "readable");
++      dbus_connection_send (connection, ret, NULL);
++      dbus_message_unref (ret);
++      return FALSE;
++    }
++  return TRUE;
++}
++
+ static DBusHandlerResult
+ object_registration_message (DBusConnection  *connection,
+                              DBusMessage     *message,
+@@ -1739,7 +1921,7 @@ object_registration_message (DBusConnection  *connection,
+   gboolean getter;
+   gboolean getall;
+   char *s;
+-  const char *wincaps_propname;
++  const char *requested_propname;
+   const char *wincaps_propiface;
+   DBusMessageIter iter;
+   const DBusGMethodInfo *method;
+@@ -1761,7 +1943,8 @@ object_registration_message (DBusConnection  *connection,
+     return invoke_object_method (object, object_info, method, connection, message);
+ 
+   /* If no metainfo, we can still do properties and signals
+-   * via standard GLib introspection
++   * via standard GLib introspection.  Note we do now check
++   * property access against the metainfo if available.
+    */
+   getter = FALSE;
+   setter = FALSE;
+@@ -1810,10 +1993,16 @@ object_registration_message (DBusConnection  *connection,
+           g_warning ("Property get or set does not have a property name string as second arg\n");
+           return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+         }
+-      dbus_message_iter_get_basic (&iter, &wincaps_propname);
++      dbus_message_iter_get_basic (&iter, &requested_propname);
+       dbus_message_iter_next (&iter);
+ 
+-      s = lookup_property_name (object, wincaps_propiface, wincaps_propname);
++      s = lookup_property_name (object, wincaps_propiface, requested_propname);
++
++      if (!check_property_access (connection, message, object, wincaps_propiface, requested_propname, s, setter))
++        {
++          g_free (s);
++          return DBUS_HANDLER_RESULT_HANDLED;
++        }
+ 
+       pspec = g_object_class_find_property (G_OBJECT_GET_CLASS (object),
+                                             s);
+@@ -1849,7 +2038,7 @@ object_registration_message (DBusConnection  *connection,
+         {
+           ret = dbus_message_new_error_printf (message,
+                                                DBUS_ERROR_INVALID_ARGS,
+-                                               "No such property %s", wincaps_propname);
++                                               "No such property %s", requested_propname);
+         }
+     }
+ 
+@@ -1991,8 +2180,8 @@ export_signals (DBusGConnection *connection, const GList *info_list, GObject *ob
+           GClosure *closure;
+           char *s;
+ 
+-          sigdata = propsig_iterate (sigdata, &iface, &signame);
+-          
++          sigdata = signal_iterate (sigdata, &iface, &signame);
++
+           s = _dbus_gutils_wincaps_to_uscore (signame);
+ 
+           id = g_signal_lookup (s, gtype);
+@@ -2166,6 +2355,28 @@ dbus_g_error_info_free (gpointer p)
+  */
+ 
+ /**
++ * dbus_glib_global_set_disable_legacy_property_access:
++ *
++ * For historical reasons, DBus-GLib will allow read-only
++ * access to every GObject property of an object exported
++ * to the bus, regardless of whether or not the property
++ * is listed in the type info installed with
++ * dbus_g_object_type_install_info().  (Write access is
++ * denied however).
++ *
++ * If you wish to restrict even read-only access, you
++ * can call this method to globally change the behavior
++ * for the entire process.
++ *
++ * Since: 0.88
++ */
++void
++dbus_glib_global_set_disable_legacy_property_access (void)
++{
++  disable_legacy_property_access = TRUE;
++}
++
++/**
+  * dbus_g_object_type_install_info:
+  * @object_type: #GType for the object
+  * @info: introspection data generated by #dbus-glib-tool
+@@ -2929,23 +3140,23 @@ _dbus_gobject_test (const char *test_data_dir)
+ 
+   sigdata = dbus_glib_internal_test_object_info.exported_signals;
+   g_assert (*sigdata != '\0');
+-  sigdata = propsig_iterate (sigdata, &iface, &signame);
++  sigdata = signal_iterate (sigdata, &iface, &signame);
+   g_assert (!strcmp (iface, "org.freedesktop.DBus.Tests.MyObject"));
+   g_assert (!strcmp (signame, "Frobnicate"));
+   g_assert (*sigdata != '\0');
+-  sigdata = propsig_iterate (sigdata, &iface, &signame);
++  sigdata = signal_iterate (sigdata, &iface, &signame);
+   g_assert (!strcmp (iface, "org.freedesktop.DBus.Tests.FooObject"));
+   g_assert (!strcmp (signame, "Sig0"));
+   g_assert (*sigdata != '\0');
+-  sigdata = propsig_iterate (sigdata, &iface, &signame);
++  sigdata = signal_iterate (sigdata, &iface, &signame);
+   g_assert (!strcmp (iface, "org.freedesktop.DBus.Tests.FooObject"));
+   g_assert (!strcmp (signame, "Sig1"));
+   g_assert (*sigdata != '\0');
+-  sigdata = propsig_iterate (sigdata, &iface, &signame);
++  sigdata = signal_iterate (sigdata, &iface, &signame);
+   g_assert (!strcmp (iface, "org.freedesktop.DBus.Tests.FooObject"));
+   g_assert (!strcmp (signame, "Sig2"));
+   g_assert (*sigdata == '\0');
+-  
++
+ 
+   i = 0;
+   while (i < (int) G_N_ELEMENTS (name_pairs))
+diff --git a/test/core/my-object.c b/test/core/my-object.c
+index 0fa8277..238cd6f 100644
+--- a/test/core/my-object.c
++++ b/test/core/my-object.c
+@@ -11,7 +11,10 @@
+ enum
+ {
+   PROP_0,
+-  PROP_THIS_IS_A_STRING
++  PROP_THIS_IS_A_STRING,
++  PROP_NO_TOUCHING,
++  PROP_SUPER_STUDLY,
++  PROP_SHOULD_BE_HIDDEN
+ };
+ 
+ enum
+@@ -53,7 +56,19 @@ my_object_set_property (GObject      *object,
+       g_free (mobject->this_is_a_string);
+       mobject->this_is_a_string = g_value_dup_string (value);
+       break;
+-      
++
++    case PROP_NO_TOUCHING:
++      mobject->notouching = g_value_get_uint (value);
++      break;
++
++    case PROP_SUPER_STUDLY:
++      mobject->super_studly = g_value_get_double (value);
++      break;
++    
++    case PROP_SHOULD_BE_HIDDEN:
++      mobject->should_be_hidden = g_value_get_boolean (value);
++      break;
++
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+       break;
+@@ -75,7 +90,19 @@ my_object_get_property (GObject      *object,
+     case PROP_THIS_IS_A_STRING:
+       g_value_set_string (value, mobject->this_is_a_string);
+       break;
++
++    case PROP_NO_TOUCHING:
++      g_value_set_uint (value, mobject->notouching);
++      break;
++
++    case PROP_SUPER_STUDLY:
++      g_value_set_double (value, mobject->super_studly);
++      break;
+       
++    case PROP_SHOULD_BE_HIDDEN:
++      g_value_set_boolean (value, mobject->should_be_hidden);
++      break;
++
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+       break;
+@@ -86,6 +113,7 @@ static void
+ my_object_init (MyObject *obj)
+ {
+   obj->val = 0;
++  obj->notouching = 42;
+ }
+ 
+ static void
+@@ -107,6 +135,30 @@ my_object_class_init (MyObjectClass *mobject_class)
+                                                         _("Example of a string property"),
+                                                         "default value",
+                                                         G_PARAM_READWRITE));
++  g_object_class_install_property (gobject_class,
++                                   PROP_NO_TOUCHING,
++                                   g_param_spec_uint ("no_touching",
++                                                      _("Don't touch"),
++                                                      _("Example of a readonly property (for export)"),
++                                                      0, 100, 42,
++                                                      G_PARAM_READWRITE));
++
++  g_object_class_install_property (gobject_class,
++                				   PROP_SUPER_STUDLY,
++				                   g_param_spec_double ("super-studly",
++                                                        _("In Studly Caps"),
++                                                        _("Example of a StudlyCaps property"),
++                                                        0, 256, 128,
++                                                        G_PARAM_READWRITE));
++                                                        
++  g_object_class_install_property (gobject_class,
++                				   PROP_SHOULD_BE_HIDDEN,
++				                   g_param_spec_boolean ("should-be-hidden",
++                                                        _("A non-exported property"),
++                                                        _("Example of a property we don't want exported"),
++                                                        FALSE,
++                                                        G_PARAM_READWRITE));
++
+   signals[FROBNICATE] =
+     g_signal_new ("frobnicate",
+ 		  G_OBJECT_CLASS_TYPE (mobject_class),
+@@ -785,6 +837,11 @@ my_object_async_throw_error (MyObject *obj, DBusGMethodInvocation *context)
+   g_idle_add ((GSourceFunc)do_async_error,  data);
+ }
+ 
++void
++my_object_unsafe_disable_legacy_property_access (MyObject *obj)
++{
++  dbus_glib_global_set_disable_legacy_property_access ();
++}
+ 
+ extern GMainLoop *loop;
+ 
+diff --git a/test/core/my-object.h b/test/core/my-object.h
+index df82b66..a93d7fd 100644
+--- a/test/core/my-object.h
++++ b/test/core/my-object.h
+@@ -13,7 +13,10 @@ struct MyObject
+ {
+   GObject parent;
+   char *this_is_a_string;
++  guint notouching;
+   guint val;
++  gdouble super_studly;
++  gboolean should_be_hidden;
+ };
+ 
+ struct MyObjectClass
+@@ -110,4 +113,6 @@ void my_object_async_increment (MyObject *obj, gint32 x, DBusGMethodInvocation *
+ 
+ void my_object_async_throw_error (MyObject *obj, DBusGMethodInvocation *context);
+ 
++void my_object_unsafe_disable_legacy_property_access (MyObject *obj);
++
+ #endif
+diff --git a/test/core/test-dbus-glib.c b/test/core/test-dbus-glib.c
+index 0376f0d..d801249 100644
+--- a/test/core/test-dbus-glib.c
++++ b/test/core/test-dbus-glib.c
+@@ -324,38 +324,48 @@ test_base_class_get_all (DBusGConnection *connection,
+                             G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
+                             G_TYPE_INVALID,
+                             DBUS_TYPE_G_MAP_OF_VARIANT, &hash, G_TYPE_INVALID))
+-      lose_gerror ("Unexpected error for GetProperty call of base class interface\n", error);
++      lose_gerror ("Unexpected error for GetProperty call of base class interface", error);
+     g_clear_error (&error);
+ 
+     if (!hash)
+       {
+         lose ("%s: Unexpected NULL hash table returned for GetAll call of base "
+-              "class interface\n", object_path);
++              "class interface", object_path);
+       }
+ 
+-    if (g_hash_table_size (hash) != 1)
++    if (g_hash_table_size (hash) != 3)
+       {
+-        lose ("%s: Unexpected hash table size %d (expected 1) returned for GetAll "
+-              " call of base class interface\n", object_path, g_hash_table_size (hash));
++        lose ("%s: Unexpected hash table size %d (expected 3) returned for GetAll "
++              " call of base class interface", object_path, g_hash_table_size (hash));
+       }
+     value = g_hash_table_lookup (hash, "this_is_a_string");
+     if (!value)
+       {
+         lose ("%s: Unexpected missing 'this_is_a_string' property for GetAll "
+-              "call of base class interface\n", object_path);
++              "call of base class interface", object_path);
+       }
+     if (!G_VALUE_HOLDS_STRING (value))
+       {
+         lose ("%s: Unexpected wrong type for 'this_is_a_string' property for "
+-              "GetAll call of base class interface\n", object_path);
++              "GetAll call of base class interface", object_path);
+       }
+     foo = g_value_get_string (value);
+     if (!foo || strcmp (foo, expected_string_value))
+       {
+         lose ("%s: Unexpected value for 'this_is_a_string' property for GetAll "
+-              "call of base class interface\n", object_path);
++              "call of base class interface", object_path);
+       }
+ 
++    value = g_hash_table_lookup (hash, "no-touching");
++    if (!value)
++      lose ("%s: Unexpected missing 'no-touching' property for GetAll "
++            "call of base class interface", object_path);
++    if (!G_VALUE_HOLDS_UINT (value))
++      lose ("%s: Unexpected wrong type for 'no-touching' property for "
++            "GetAll call of base class interface", object_path);
++    if (g_value_get_uint (value) != 42)
++      lose ("%s: Unexpected wrong value \"%d\" for 'no-touching' property for "
++            "GetAll call of base class interface", object_path, g_value_get_uint (value));
+     g_hash_table_destroy (hash);
+     hash = NULL;
+   }
+@@ -1987,6 +1997,7 @@ main (int argc, char **argv)
+ 	  {
+ 	    GSList *elt;
+ 	    gboolean found_manyargs;
++	    gboolean found_no_touching = FALSE;
+ 	    
+ 	    found_myobject = TRUE;
+ 	    
+@@ -2004,6 +2015,23 @@ main (int argc, char **argv)
+ 	      }
+ 	    if (!found_manyargs)
+ 	      lose ("Missing method org.freedesktop.DBus.GLib.Tests.MyObject.ManyArgs");
++	    for (elt = interface_info_get_properties (iface); elt; elt = elt->next)
++	      {
++	        PropertyInfo *prop = elt->data;
++	        
++	        if (strcmp (property_info_get_name (prop), "no-touching") == 0)
++	          {
++	            if (property_info_get_access (prop) != PROPERTY_READ)
++	              lose ("property no-touching had incorrect access %d", property_info_get_access (prop));
++	            else
++	              {
++	                found_no_touching = TRUE;
++	                break;
++	              }
++	          }
++	      }
++	    if (!found_no_touching)
++	      lose ("didn't find property \"no-touching\" in org.freedesktop.DBus.GLib.Tests.MyObject");
+ 	  }
+ 	else if (!found_fooobject && strcmp (interface_info_get_name (iface), "org.freedesktop.DBus.GLib.Tests.FooObject") == 0)
+ 	  found_fooobject = TRUE;
+@@ -2019,6 +2047,8 @@ main (int argc, char **argv)
+ 
+   /* Properties tests */
+   property_proxy = dbus_g_proxy_new_from_proxy (proxy, DBUS_INTERFACE_PROPERTIES, NULL);
++  g_object_unref (proxy);
++  proxy = NULL;
+ 
+   g_print ("Calling GetProperty (1)\n");
+   {
+@@ -2047,6 +2077,48 @@ main (int argc, char **argv)
+     g_value_unset (&value);
+   }
+ 
++  g_print ("Calling GetProperty of read-only property\n");
++  {
++    GValue value = {0,};
++    if (!dbus_g_proxy_call (property_proxy, "Get", &error,
++                            G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
++                            G_TYPE_STRING, "no-touching",
++                            G_TYPE_INVALID,
++                            G_TYPE_VALUE, &value, G_TYPE_INVALID))
++      lose_gerror ("Failed to complete GetProperty no-touching call", error);
++    g_assert (G_VALUE_HOLDS (&value, G_TYPE_UINT));
++    g_assert (g_value_get_uint (&value) == 42);
++    g_value_unset (&value);
++  }
++
++  g_print ("Calling SetProperty (1)\n");
++  {
++    GValue value = {0,};
++    g_value_init (&value, G_TYPE_UINT);
++    g_value_set_uint (&value, 40);
++    if (dbus_g_proxy_call (property_proxy, "Set", &error,
++                           G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
++                           G_TYPE_STRING, "no-touching",
++                           G_TYPE_VALUE, &value, G_TYPE_INVALID, G_TYPE_INVALID))
++      lose ("Unexpected success from SetProperty call for read-only value \"no-touching\"");
++    g_clear_error (&error);
++    g_value_unset (&value);
++  }
++
++  g_print ("Calling GetProperty of read-only property (again)\n");
++  {
++    GValue value = {0,};
++    if (!dbus_g_proxy_call (property_proxy, "Get", &error,
++                            G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
++                            G_TYPE_STRING, "no-touching",
++                            G_TYPE_INVALID,
++                            G_TYPE_VALUE, &value, G_TYPE_INVALID))
++      lose_gerror ("Failed to complete GetProperty call", error);
++    g_assert (G_VALUE_HOLDS (&value, G_TYPE_UINT));
++    g_assert (g_value_get_uint (&value) == 42);
++    g_value_unset (&value);
++  }
++
+   g_print ("Calling GetProperty (2)\n");
+   {
+     GValue value = {0,};
+@@ -2061,7 +2133,46 @@ main (int argc, char **argv)
+     g_value_unset (&value);
+   }
+ 
+-  g_print ("Calling GetProperty (3)\n");
++  g_print ("Calling GetProperty: SuperStudly\n");
++  {
++    GValue value = {0,};
++    if (!dbus_g_proxy_call (property_proxy, "Get", &error,
++                            G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
++                            G_TYPE_STRING, "SuperStudly",
++                            G_TYPE_INVALID,
++                            G_TYPE_VALUE, &value, G_TYPE_INVALID))
++      lose_gerror ("Failed to complete GetProperty call", error);
++    g_assert (G_VALUE_HOLDS (&value, G_TYPE_DOUBLE));
++    g_value_unset (&value);
++  }
++
++  g_print ("Calling GetProperty: super-studly\n");
++  {
++    GValue value = {0,};
++    if (!dbus_g_proxy_call (property_proxy, "Get", &error,
++                            G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
++                            G_TYPE_STRING, "super-studly",
++                            G_TYPE_INVALID,
++                            G_TYPE_VALUE, &value, G_TYPE_INVALID))
++      lose_gerror ("Failed to complete GetProperty call", error);
++    g_assert (G_VALUE_HOLDS (&value, G_TYPE_DOUBLE));
++    g_value_unset (&value);
++  }
++
++  g_print ("Calling GetProperty: super_studly\n");
++  {
++    GValue value = {0,};
++    if (!dbus_g_proxy_call (property_proxy, "Get", &error,
++                            G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
++                            G_TYPE_STRING, "super_studly",
++                            G_TYPE_INVALID,
++                            G_TYPE_VALUE, &value, G_TYPE_INVALID))
++      lose_gerror ("Failed to complete GetProperty call", error);
++    g_assert (G_VALUE_HOLDS (&value, G_TYPE_DOUBLE));
++    g_value_unset (&value);
++  }
++
++  g_print ("Calling GetProperty on unknown property\n");
+   {
+     GValue value = {0,};
+     if (dbus_g_proxy_call (property_proxy, "Get", &error,
+@@ -2069,13 +2180,68 @@ main (int argc, char **argv)
+                             G_TYPE_STRING, "SomeUnknownProperty", 
+                             G_TYPE_INVALID,
+                             G_TYPE_VALUE, &value, G_TYPE_INVALID))
+-      lose_gerror ("Unexpected success for GetProperty call of unknown property", error);
++      lose ("Unexpected success for GetProperty call of unknown property");
+ 
+     g_clear_error (&error);
+   }
++  
++  /* These two are expected to pass unless we call disable_legacy_property_access */
+ 
+-  g_object_unref (property_proxy);
+-  property_proxy = NULL;
++  g_print ("Calling GetProperty on not-exported property (legacy enabled)\n");
++  {
++    GValue value = {0,};
++    if (!dbus_g_proxy_call (property_proxy, "Get", &error,
++                            G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
++                            G_TYPE_STRING, "should-be-hidden", 
++                            G_TYPE_INVALID,
++                            G_TYPE_VALUE, &value, G_TYPE_INVALID))
++      lose_gerror ("Failed GetProperty call of \"should-be-hidden\" property", error);
++    g_assert (G_VALUE_HOLDS_BOOLEAN (&value));
++    g_assert (g_value_get_boolean (&value) == FALSE);
++    g_value_unset (&value);
++  }
++  
++  g_print ("Calling GetProperty on not-exported property (legacy enabled)\n");
++  {
++    GValue value = {0,};
++    if (!dbus_g_proxy_call (property_proxy, "Get", &error,
++                            G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
++                            G_TYPE_STRING, "ShouldBeHidden", 
++                            G_TYPE_INVALID,
++                            G_TYPE_VALUE, &value, G_TYPE_INVALID))
++      lose_gerror ("Failed GetProperty call of \"ShouldBeHidden\" property", error);
++
++    g_value_unset (&value);
++  }
++  
++  g_print ("Calling SetProperty on not-exported property (legacy enabled)\n");
++  {
++    GValue value = {0,};
++    g_value_init (&value, G_TYPE_BOOLEAN);
++    g_value_set_boolean (&value, TRUE);
++    if (dbus_g_proxy_call (property_proxy, "Set", &error,
++                            G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
++                            G_TYPE_STRING, "should-be-hidden",
++                            G_TYPE_VALUE, &value,
++                            G_TYPE_INVALID, G_TYPE_INVALID))
++      lose ("Unexpected success from SetProperty call of \"should-be-hidden\" property");
++    g_value_unset (&value);
++    g_clear_error (&error);
++  }
++  
++  g_print ("Calling GetProperty on not-exported property (legacy enabled)\n");
++  {
++    GValue value = {0,};
++    if (!dbus_g_proxy_call (property_proxy, "Get", &error,
++                            G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
++                            G_TYPE_STRING, "should-be-hidden", 
++                            G_TYPE_INVALID,
++                            G_TYPE_VALUE, &value, G_TYPE_INVALID))
++      lose_gerror ("Failed GetProperty call of \"should-be-hidden\" property", error);
++    g_assert (G_VALUE_HOLDS_BOOLEAN (&value));
++    g_assert (g_value_get_boolean (&value) == FALSE);
++    g_value_unset (&value);
++  }
+ 
+   /* Test GetAll */
+   /* 'testing value' set earlier by the SetProperty tests */
+@@ -2095,6 +2261,64 @@ main (int argc, char **argv)
+    */
+   test_subclass_get_all (connection, "/org/freedesktop/DBus/GLib/Tests/MyTestObjectSubclass");
+ 
++  /* Now, call disable_legacy_property_access */
++
++  g_assert (proxy == NULL);
++  proxy = dbus_g_proxy_new_for_name_owner (connection,
++                                           "org.freedesktop.DBus.GLib.TestService",
++                                           "/org/freedesktop/DBus/GLib/Tests/MyTestObject",
++                                           "org.freedesktop.DBus.GLib.Tests.MyObject",
++                                           &error);
++
++  if (!dbus_g_proxy_call (proxy, "UnsafeDisableLegacyPropertyAccess", &error,
++                          G_TYPE_INVALID, G_TYPE_INVALID))
++    lose_gerror ("Failed to invoke UnsafeDisableLegacyPropertyAccess", error);
++  
++  g_object_unref (proxy);
++  proxy = NULL;
++
++  g_print ("Calling GetProperty on not-exported property (legacy *disabled*)\n");
++  {
++    GValue value = {0,};
++    if (dbus_g_proxy_call (property_proxy, "Get", &error,
++                            G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
++                            G_TYPE_STRING, "should-be-hidden", 
++                            G_TYPE_INVALID,
++                            G_TYPE_VALUE, &value, G_TYPE_INVALID))
++      lose ("Unexpected success from GetProperty call of \"should-be-hidden\" property");
++    g_clear_error (&error);
++  }
++  
++  g_print ("Calling GetProperty on not-exported property (legacy *disabled*)\n");
++  {
++    GValue value = {0,};
++    if (dbus_g_proxy_call (property_proxy, "Get", &error,
++                            G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
++                            G_TYPE_STRING, "ShouldBeHidden", 
++                            G_TYPE_INVALID,
++                            G_TYPE_VALUE, &value, G_TYPE_INVALID))
++      lose ("Unexpected success from GetProperty call of \"ShouldBeHidden\" property");
++    g_clear_error (&error);
++  }
++  
++  g_print ("Calling SetProperty on not-exported property (legacy *disabled*)\n");
++  {
++    GValue value = {0,};
++    g_value_init (&value, G_TYPE_BOOLEAN);
++    g_value_set_boolean (&value, FALSE);
++    if (dbus_g_proxy_call (property_proxy, "Set", &error,
++                            G_TYPE_STRING, "org.freedesktop.DBus.GLib.Tests.MyObject",
++                            G_TYPE_STRING, "should-be-hidden",
++                            G_TYPE_VALUE, &value,
++                            G_TYPE_INVALID, G_TYPE_INVALID))
++      lose ("Unexpected success from SetProperty call of \"should-be-hidden\" property");
++    g_value_unset (&value);
++    g_clear_error (&error);
++  }
++
++  g_object_unref (property_proxy);
++  property_proxy = NULL;
++
+   test_terminate_proxy1 = dbus_g_proxy_new_for_name_owner (connection,
+                             "org.freedesktop.DBus.GLib.TestService",
+                             "/org/freedesktop/DBus/GLib/Tests/MyTestObject",
+diff --git a/test/core/test-service-glib.xml b/test/core/test-service-glib.xml
+index 3bd2de3..2465ef1 100644
+--- a/test/core/test-service-glib.xml
++++ b/test/core/test-service-glib.xml
+@@ -3,6 +3,8 @@
+ <node name="/org/freedesktop/DBus/GLib/Tests/MyTestObject">
+   <interface name="org.freedesktop.DBus.GLib.Tests.MyObject">
+     <property name="this_is_a_string" type="s" access="readwrite"/>
++    <property name="no-touching" type="u" access="read"/>
++    <property name="SuperStudly" type="d" access="readwrite"/>
+ 
+     <method name="DoNothing">
+     </method>
+@@ -172,6 +174,9 @@
+ 
+     <method name="EmitFrobnicate">
+     </method>
++    
++    <method name="UnsafeDisableLegacyPropertyAccess">
++    </method>
+ 
+     <!-- Export signals -->
+     <signal name="Frobnicate"/>
+-- 
+1.6.6.1
+
